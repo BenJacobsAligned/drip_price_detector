@@ -10,6 +10,7 @@ jobs:
       BROWSERBASE_API_KEY: ${{ secrets.BROWSERBASE_API_KEY }}
       BROWSERBASE_PROJECT_ID: ${{ secrets.BROWSERBASE_PROJECT_ID }}
       GOOGLE_GENERATIVE_AI_API_KEY: ${{ secrets.GOOGLE_GENERATIVE_AI_API_KEY }}
+      TARGET_URL: https://example.com
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -23,4 +24,11 @@ jobs:
         run: npm install
 
       - name: Run Stagehand
-        run: npm run run:once
+        run: npm run run:target
+
+      - name: Upload output artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: drip-price-output
+          path: runs/output.jsonl
+          retention-days: 7
