@@ -24,7 +24,7 @@ jobs:
         run: npm install
 
       - name: Run Stagehand
-        run: npm run run:target
+        run: npm run run:discounttire
 
       - name: Upload output artifact
         uses: actions/upload-artifact@v4
