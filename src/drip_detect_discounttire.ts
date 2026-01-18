@@ -118,6 +118,9 @@ const retryStep = async <T>(label: string, action: () => Promise<T>) => {
 const isBlockedObservedAction = (description: string) => {
   const lowered = description.toLowerCase();
   return [
+    "enable accessibility",
+    "skip to main content",
+    "accessibility policy",
     "usablenet",
     "tire price guide",
     "send to phone",
@@ -152,6 +155,9 @@ const observeAndAct = async (
   notes: string[],
 ) => {
   const observed = (await stagehand.observe({ instruction })) ?? [];
+  if (observed.length === 0) {
+    notes.push(`observe returned empty list for: ${instruction}`);
+  }
   const action = pickObservedAction(observed, notes);
 
   if (!action) {
@@ -246,14 +252,6 @@ const waitForAny = async (
   return false;
 };
 
-const urlChanged = async (
-  page: Awaited<ReturnType<Stagehand["context"]["newPage"]>>,
-  beforeUrl: string,
-) => {
-  const current = page.url();
-  return Boolean(current && current !== beforeUrl);
-};
-
 const locatorCountAtLeast = async (
   page: Awaited<ReturnType<Stagehand["context"]["newPage"]>>,
   selector: string,
@@ -313,7 +311,7 @@ async function main() {
       final_total_text: null,
       fee_lines: [],
       line_items: [],
-      status: "failed",
+      status: "blocked",
       notes:
         "Missing Google LLM API key. Set GOOGLE_API_KEY or GOOGLE_GENERATIVE_AI_API_KEY.",
     };
@@ -374,7 +372,7 @@ async function main() {
         sessionUrl,
         debugUrl,
         sessionId,
-        status: "failed",
+        status: "blocked",
         notes: runNotes.join(" | "),
       });
       process.exitCode = 1;
@@ -384,23 +382,53 @@ async function main() {
     {
       let searchOk = false;
       for (let attempt = 0; attempt < 3; attempt += 1) {
-        const beforeUrl = page.url();
         try {
-          await observeAndAct(
-            stagehand,
-            page,
-            `Click the main site search input in the header (not accessibility links), type "${searchQuery}".`,
-            runNotes,
-          );
-          await observeAndAct(
-            stagehand,
-            page,
-            "Press Enter in the search input or click the search icon next to the search field.",
-            runNotes,
+          const observeInstruction =
+            "Find the main search input in the site header with placeholder 'What can we help you find?' Return the clickable element for focusing the search input.";
+          const observed = (await stagehand.observe({
+            instruction: observeInstruction,
+          })) ?? [];
+          if (observed.length === 0) {
+            runNotes.push(
+              "search observe returned empty list, falling back to direct act",
+            );
+            await stagehand.act(
+              "Click the search box in the header that says 'What can we help you find?'",
+            );
+          } else {
+            let action = pickObservedAction(observed, runNotes);
+            if (!action) {
+              const refinedObserved = (await stagehand.observe({
+                instruction:
+                  "Focus the header search input with placeholder 'What can we help you find?' Ignore accessibility links and policy banners.",
+              })) ?? [];
+              if (refinedObserved.length === 0) {
+                runNotes.push(
+                  "refined search observe returned empty list, falling back to direct act",
+                );
+                await stagehand.act(
+                  "Click the search box in the header that says 'What can we help you find?'",
+                );
+              } else {
+                action = pickObservedAction(refinedObserved, runNotes);
+              }
+            }
+            if (!action) {
+              runNotes.push(
+                "search observe returned no usable actions after refinement",
+              );
+              await stagehand.act(
+                "Click the search box in the header that says 'What can we help you find?'",
+              );
+            } else {
+              await stagehand.act(action);
+            }
+          }
+          await stagehand.act(
+            `Type "${searchQuery}" into the search input and press Enter`,
           );
           searchOk = await waitForAny(
             [
-              () => urlChanged(page, beforeUrl),
               () => waitForLocatorVisible(page, "text=/Results|Search results/i", 1000),
               () =>
                 locatorCountAtLeast(
@@ -481,7 +509,7 @@ async function main() {
         sessionUrl,
         debugUrl,
         sessionId,
-        status: "failed",
+        status: "blocked",
         notes: runNotes.join(" | "),
       });
       process.exitCode = 1;
@@ -654,7 +682,7 @@ async function main() {
             sessionUrl,
             debugUrl,
             sessionId,
-            status: "failed",
+            status: "blocked",
             notes: notes.join(" | "),
           });
           continue;
@@ -694,7 +722,7 @@ async function main() {
           sessionUrl,
           debugUrl,
           sessionId,
-          status: "failed",
+          status: "blocked",
           notes: notes.join(" | "),
         });
       }
@@ -715,7 +743,7 @@ async function main() {
       sessionUrl,
       debugUrl,
       sessionId,
-      status: "failed",
+      status: "blocked",
       notes: runNotes.join(" | "),
     });
     process.exitCode = 1;
@@ -739,7 +767,7 @@ main().catch(async (error) => {
     final_total_text: null,
     fee_lines: [],
     line_items: [],
-    status: "failed",
+    status: "blocked",
     notes: notes.join(" | "),
   });
   process.exitCode = 1;
