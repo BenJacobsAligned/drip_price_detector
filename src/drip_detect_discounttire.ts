@@ -62,6 +62,13 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const asArray = <T,>(value: unknown): T[] =>
   Array.isArray(value) ? (value as T[]) : [];
 
+class BlockedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "BlockedError";
+  }
+}
+
 const appendOutput = async (record: OutputRecord) => {
   await mkdir(runsDir, { recursive: true });
   await appendFile(outputFile, `${JSON.stringify(record)}\n`, "utf8");
@@ -98,6 +105,9 @@ const retryStep = async <T>(label: string, action: () => Promise<T>) => {
       }
     }
   }
+  if (lastError instanceof BlockedError) {
+    throw lastError;
+  }
   throw new Error(
     `${label} failed after retries: ${
       lastError instanceof Error ? lastError.message : String(lastError)
@@ -107,6 +117,7 @@ const retryStep = async <T>(label: string, action: () => Promise<T>) => {
 
 const observeAndAct = async (
   stagehand: Stagehand,
+  page: Awaited<ReturnType<Stagehand["context"]["newPage"]>>,
   instruction: string,
   notes: string[],
 ) => {
@@ -119,8 +130,77 @@ const observeAndAct = async (
     return false;
   }
 
-  await stagehand.act(actions[0]);
+  const action = actions[0] as { selector?: string };
+  try {
+    const result = await stagehand.act(action);
+    if (result && typeof result === "object" && "success" in result) {
+      if ((result as { success?: boolean }).success === false) {
+        throw new Error("stagehand.act returned success=false");
+      }
+    }
+  } catch (error) {
+    notes.push(
+      `stagehand.act failed, trying playwright click: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+    if (action?.selector) {
+      await page.click(action.selector, { timeout: 10000 });
+      notes.push(`playwright click success: ${action.selector}`);
+    } else {
+      throw error;
+    }
+  }
   return true;
+};
+
+type DomSignal = {
+  name: string;
+  selector: string;
+};
+
+const waitForTransition = async (
+  page: Awaited<ReturnType<Stagehand["context"]["newPage"]>>,
+  label: string,
+  notes: string[],
+  domSignals: DomSignal[],
+  timeoutMs = 10000,
+) => {
+  const startUrl = page.url();
+  const urlPromise = page
+    .waitForURL((url) => url.toString() !== startUrl, {
+      timeout: timeoutMs,
+    })
+    .then(() => ({ type: "url_changed" as const }));
+
+  const domPromise = Promise.any(
+    domSignals.map((signal) =>
+      page
+        .waitForSelector(signal.selector, {
+          state: "visible",
+          timeout: timeoutMs,
+        })
+        .then(() => ({ type: "dom_changed" as const, name: signal.name })),
+    ),
+  );
+
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    setTimeout(() => {
+      reject(
+        new BlockedError(
+          `${label} transition timed out after ${timeoutMs}ms`,
+        ),
+      );
+    }, timeoutMs);
+  });
+
+  const result = await Promise.race([urlPromise, domPromise, timeoutPromise]);
+  if (result.type === "url_changed") {
+    notes.push(`${label} transition=url_changed`);
+  } else {
+    notes.push(`${label} transition=dom_changed:${result.name}`);
+  }
+  return result;
 };
 
 process.on("unhandledRejection", (reason) =>
@@ -135,9 +215,24 @@ async function main() {
     process.env.GOOGLE_API_KEY ?? process.env.GOOGLE_GENERATIVE_AI_API_KEY;
 
   if (!googleApiKey) {
-    throw new Error(
-      "Missing Google LLM API key. Set GOOGLE_API_KEY or GOOGLE_GENERATIVE_AI_API_KEY.",
-    );
+    const record: OutputRecord = {
+      timestamp: new Date().toISOString(),
+      site: "discounttire",
+      search_query: process.env.SEARCH_QUERY ?? "Michelin",
+      product_name: null,
+      product_url: null,
+      initial_price_text: null,
+      qualifiers: null,
+      final_total_text: null,
+      fee_lines: [],
+      line_items: [],
+      status: "failed",
+      notes:
+        "Missing Google LLM API key. Set GOOGLE_API_KEY or GOOGLE_GENERATIVE_AI_API_KEY.",
+    };
+    await appendOutput(record);
+    process.exitCode = 1;
+    return;
   }
 
   process.env.GOOGLE_API_KEY = googleApiKey;
@@ -203,10 +298,22 @@ async function main() {
       await retryStep("search", async () => {
         await observeAndAct(
           stagehand,
+          page,
           `Find the site search input on Discount Tire, type "${searchQuery}", submit the search, and dismiss any popups that block typing if needed.`,
           runNotes,
         );
-        await sleep(1500);
+        await waitForTransition(
+          page,
+          "search_submit",
+          runNotes,
+          [
+            {
+              name: "results_grid",
+              selector:
+                "[data-testid='product-grid'], [data-testid='product-list'], .product-grid, .product-list, .search-results",
+            },
+          ],
+        );
       });
     } catch (error) {
       const normalized = formatErrorNotes(runNotes, error);
@@ -224,7 +331,7 @@ async function main() {
         sessionUrl,
         debugUrl,
         sessionId,
-        status: "failed",
+        status: normalized instanceof BlockedError ? "blocked" : "failed",
         notes: runNotes.join(" | "),
       });
       process.exitCode = 1;
@@ -348,19 +455,51 @@ async function main() {
           await retryStep("add to cart", async () => {
             await observeAndAct(
               stagehand,
+              page,
               "Click the primary 'Add to cart' or equivalent purchase button for this tire without selecting paid add-ons.",
               notes,
             );
-            await sleep(1500);
+            await waitForTransition(
+              page,
+              "add_to_cart",
+              notes,
+              [
+                {
+                  name: "cart_drawer",
+                  selector:
+                    "[data-testid='cart-drawer'], .cart-drawer, #cart-drawer, [aria-label='Cart']",
+                },
+                {
+                  name: "added_to_cart_toast",
+                  selector: "text=/added to cart/i",
+                },
+              ],
+            );
           });
 
           await retryStep("open cart", async () => {
             await observeAndAct(
               stagehand,
+              page,
               "Open the cart or checkout review page that shows totals without submitting payment.",
               notes,
             );
-            await sleep(1500);
+            await waitForTransition(
+              page,
+              "open_cart",
+              notes,
+              [
+                {
+                  name: "cart_header",
+                  selector: "h1:has-text('Cart'), h2:has-text('Cart')",
+                },
+                {
+                  name: "cart_drawer",
+                  selector:
+                    "[data-testid='cart-drawer'], .cart-drawer, #cart-drawer, [aria-label='Cart']",
+                },
+              ],
+            );
           });
         } catch (error) {
           const normalized = formatErrorNotes(notes, error);
@@ -378,7 +517,7 @@ async function main() {
             sessionUrl,
             debugUrl,
             sessionId,
-            status: "failed",
+            status: normalized instanceof BlockedError ? "blocked" : "failed",
             notes: notes.join(" | "),
           });
           continue;
@@ -478,7 +617,23 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  console.error("FATAL", error);
-  process.exit(1);
+main().catch(async (error) => {
+  const notes: string[] = [];
+  const normalized = formatErrorNotes(notes, error);
+  console.error("FATAL", normalized);
+  await appendOutput({
+    timestamp: new Date().toISOString(),
+    site: "discounttire",
+    search_query: process.env.SEARCH_QUERY ?? "Michelin",
+    product_name: null,
+    product_url: null,
+    initial_price_text: null,
+    qualifiers: null,
+    final_total_text: null,
+    fee_lines: [],
+    line_items: [],
+    status: "failed",
+    notes: notes.join(" | "),
+  });
+  process.exitCode = 1;
 });
