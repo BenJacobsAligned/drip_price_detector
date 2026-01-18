@@ -116,7 +116,7 @@ const retryStep = async <T>(label: string, action: () => Promise<T>) => {
 };
 
 const blockedActionDescriptionRegex =
-  /accessibility|skip to main|usableNet|policy|send to phone|schedule appointment/i;
+  /accessibility|skip to main|usableNet|tire price guide|free services|policy|send to phone|schedule appointment/i;
 
 type ObserveThenActOptions = {
   fallbackInstruction: string;
@@ -383,29 +383,68 @@ async function main() {
       let searchOk = false;
       for (let attempt = 0; attempt < 3; attempt += 1) {
         try {
-          const focusResult = await observeThenAct(
-            stagehand,
-            "Focus the header search input with placeholder text 'What can we help you find?'.",
-            {
-              fallbackInstruction:
-                "Click the header search box labeled 'What can we help you find?'.",
-            },
-          );
-          runNotes.push(...focusResult.notes);
-          if (!focusResult.ok) {
-            throw new BlockedError("search focus failed");
+          const fallbackInstruction = `Click the main header search input with placeholder "What can we help you find?", type "${searchQuery}", and press Enter.`;
+          let observedActions: {
+            description?: string;
+            method?: string;
+            twoStep?: boolean;
+          }[] = [];
+          try {
+            const observed =
+              (await stagehand.observe({
+                instruction:
+                  "Find the main header search input with placeholder 'What can we help you find?'.",
+              })) ?? [];
+            observedActions = asArray<{
+              description?: string;
+              method?: string;
+              twoStep?: boolean;
+            }>(observed);
+          } catch (error) {
+            runNotes.push(
+              `search_observe_failed=${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
           }
 
-          const typeResult = await observeThenAct(
-            stagehand,
-            `Type "${searchQuery}" into the header search input.`,
-            {
-              fallbackInstruction: `Type "${searchQuery}" into the header search input and press Enter.`,
-            },
+          const filteredActions = observedActions.filter(
+            (action) =>
+              !action.description ||
+              !blockedActionDescriptionRegex.test(action.description),
           );
-          runNotes.push(...typeResult.notes);
-          if (!typeResult.ok) {
-            throw new BlockedError("search typing failed");
+
+          if (filteredActions.length > 0) {
+            const action = filteredActions[0];
+            const actionDescription = action.description ?? "missing description";
+            runNotes.push(`search_observe_action=${actionDescription}`);
+            console.info("search observe action", actionDescription);
+            try {
+              await stagehand.act(action);
+            } catch (error) {
+              runNotes.push(
+                `search_observe_act_failed=${
+                  error instanceof Error ? error.message : String(error)
+                }`,
+              );
+              await stagehand.act(fallbackInstruction);
+            }
+          } else {
+            runNotes.push("search_observe_empty_or_filtered");
+            await stagehand.act(fallbackInstruction);
+          }
+
+          try {
+            await stagehand.act(
+              `Type "${searchQuery}" and press Enter in the focused input.`,
+            );
+          } catch (error) {
+            runNotes.push(
+              `search_submit_failed=${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+            await stagehand.act("Click the search icon if present");
           }
 
           const searchResultReason = await waitForState(page, {
@@ -419,6 +458,8 @@ async function main() {
               ".product-card",
               "[class*='Results']",
               "[class*='ProductGrid']",
+              "h1:has-text('Results')",
+              "h2:has-text('Results')",
               "text=/results/i",
               "text=/tires/i",
             ],
@@ -431,6 +472,9 @@ async function main() {
               ? `search_submit success=${searchResultReason}`
               : "search_submit timeout",
           );
+          if (searchResultReason) {
+            console.info("search success", searchResultReason);
+          }
           if (searchOk) {
             break;
           }
