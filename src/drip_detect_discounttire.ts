@@ -115,264 +115,177 @@ const retryStep = async <T>(label: string, action: () => Promise<T>) => {
   );
 };
 
-const isBlockedObservedAction = (description: string) => {
-  const lowered = description.toLowerCase();
-  return [
-    "enable accessibility",
-    "skip to main content",
-    "accessibility policy",
-    "usablenet",
-    "tire price guide",
-    "send to phone",
-    "schedule appointment",
-  ].some((phrase) => lowered.includes(phrase));
+const blockedActionDescriptionRegex =
+  /accessibility|skip to main|usableNet|policy|send to phone|schedule appointment/i;
+
+type ObserveThenActOptions = {
+  fallbackInstruction: string;
+  filterBadActionDescriptions?: boolean;
+  maxAttempts?: number;
 };
 
-const pickObservedAction = (observed: unknown[], notes: string[]) => {
-  const actions = asArray<{ selector?: string; description?: string }>(observed);
-  if (actions.length === 0) {
-    return null;
-  }
-  const filtered = actions.filter(
-    (action) =>
-      !action.description || !isBlockedObservedAction(action.description),
-  );
-  if (filtered.length === 0) {
-    notes.push(
-      `observe returned only blocked actions: ${actions
-        .map((action) => action.description ?? "unknown")
-        .join(", ")}`,
-    );
-    return null;
-  }
-  return filtered[0];
-};
-
-const observeAndAct = async (
+const observeThenAct = async (
   stagehand: Stagehand,
-  page: Awaited<ReturnType<Stagehand["context"]["newPage"]>>,
-  instruction: string,
-  notes: string[],
+  prompt: string,
+  options: ObserveThenActOptions,
 ) => {
-  const observed = (await stagehand.observe({ instruction })) ?? [];
-  if (observed.length === 0) {
-    notes.push(`observe returned empty list for: ${instruction}`);
-  }
-  const action = pickObservedAction(observed, notes);
+  const notes: string[] = [];
+  const maxAttempts = options.maxAttempts ?? 2;
+  const shouldFilter = options.filterBadActionDescriptions ?? true;
 
-  if (!action) {
-    notes.push(`observe returned no usable actions for: ${instruction}`);
-    await stagehand.act(`Perform the action described: ${instruction}`);
-    return false;
-  }
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    let observed: unknown[] = [];
+    try {
+      observed = (await stagehand.observe({ instruction: prompt })) ?? [];
+    } catch (error) {
+      notes.push(
+        `observe_failed=${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    const actions = asArray<{ description?: string; method?: string; twoStep?: boolean }>(
+      observed,
+    );
+    const filtered = shouldFilter
+      ? actions.filter(
+          (action) =>
+            !action.description ||
+            !blockedActionDescriptionRegex.test(action.description),
+        )
+      : actions;
 
-  try {
-    const result = await stagehand.act(action);
-    if (result && typeof result === "object" && "success" in result) {
-      if ((result as { success?: boolean }).success === false) {
-        throw new Error("stagehand.act returned success=false");
+    if (filtered.length === 0) {
+      notes.push(`observe_empty_or_filtered attempt=${attempt + 1}`);
+      try {
+        await stagehand.act(options.fallbackInstruction);
+        return { ok: true, notes };
+      } catch (error) {
+        notes.push(
+          `fallback_act_failed=${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+        if (attempt < maxAttempts - 1) {
+          await sleep(1000);
+          continue;
+        }
+        return { ok: false, notes };
       }
     }
-  } catch (error) {
-    notes.push(
-      `stagehand.act failed, trying playwright click: ${
-        error instanceof Error ? error.message : String(error)
-      }`,
-    );
-    if (action?.selector) {
-      await page.click(action.selector, { timeout: 10000 });
-      notes.push(`playwright click success: ${action.selector}`);
-    } else {
-      throw error;
+
+    const action = filtered[0];
+    try {
+      await stagehand.act(action);
+      const method = action.method?.toLowerCase();
+      if (action.twoStep === true && (method === "fill" || method === "type")) {
+        try {
+          await stagehand.act("Press Enter in the focused input");
+          notes.push("observeThenAct_step2=enter");
+        } catch (error) {
+          notes.push(
+            `observeThenAct_step2_enter_failed=${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+          try {
+            await stagehand.act("Click the search icon if present");
+            notes.push("observeThenAct_step2=search_icon");
+          } catch (secondError) {
+            notes.push(
+              `observeThenAct_step2_icon_failed=${
+                secondError instanceof Error
+                  ? secondError.message
+                  : String(secondError)
+              }`,
+            );
+          }
+        }
+      }
+      return { ok: true, notes };
+    } catch (error) {
+      notes.push(
+        `act_failed attempt=${attempt + 1}=${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      if (attempt < maxAttempts - 1) {
+        await sleep(1000);
+        continue;
+      }
+      return { ok: false, notes };
     }
   }
-  return true;
+
+  return { ok: false, notes };
 };
 
-const waitForLocatorVisible = async (
-  page: Awaited<ReturnType<Stagehand["context"]["newPage"]>>,
-  selector: string,
-  timeoutMs: number,
-) => {
-  const locator = page.locator(selector).first();
-  if (
-    "waitFor" in locator &&
-    typeof (locator as { waitFor?: unknown }).waitFor === "function"
-  ) {
-    try {
-      await (
-        locator as {
-          waitFor: (opts?: { state?: "visible"; timeout?: number }) => Promise<void>;
-        }
-      ).waitFor({ state: "visible", timeout: timeoutMs });
-      return true;
-    } catch {
-      return false;
-    }
-  }
+type WaitForStateOptions = {
+  selectorsAny?: string[];
+  minCounts?: { selector: string; count: number }[];
+  timeoutMs?: number;
+};
 
+const waitForState = async (
+  page: Awaited<ReturnType<Stagehand["context"]["newPage"]>>,
+  options: WaitForStateOptions,
+) => {
+  const selectorsAny = options.selectorsAny ?? [];
+  const minCounts = options.minCounts ?? [];
+  const timeoutMs = options.timeoutMs ?? 15000;
   const start = Date.now();
+
   while (Date.now() - start < timeoutMs) {
-    try {
-      if (
-        "count" in locator &&
-        typeof (locator as { count?: unknown }).count === "function"
-      ) {
-        const count = await (locator as { count: () => Promise<number> }).count();
+    for (const selector of selectorsAny) {
+      if (selector.startsWith("text=") || selector.startsWith("text=/")) {
+        try {
+          const content = await page.textContent("body");
+          let pattern: RegExp | null = null;
+          let needle: string | null = null;
+          if (selector.startsWith("text=/")) {
+            const lastSlash = selector.lastIndexOf("/");
+            if (lastSlash > 5) {
+              const body = selector.slice(6, lastSlash);
+              const flags = selector.slice(lastSlash + 1) || "i";
+              pattern = new RegExp(body, flags);
+            }
+          } else {
+            needle = selector.slice(5);
+          }
+          if (
+            (pattern && content && pattern.test(content)) ||
+            (needle && content && content.includes(needle))
+          ) {
+            return `text:${selector}`;
+          }
+        } catch {
+          // ignore and continue polling
+        }
+        continue;
+      }
+      try {
+        const count = await page.locator(selector).count();
         if (count > 0) {
-          return true;
+          return `selectorsAny:${selector}`;
         }
-      } else if (selector.startsWith("text=") || selector.startsWith("text=/")) {
-        const content = await page.textContent("body");
-        if (content && content.match(/results/i)) {
-          return true;
-        }
-      }
-    } catch {
-      // ignore and continue polling
-    }
-    await sleep(250);
-  }
-  return false;
-};
-
-const locatorVisibleNow = async (
-  page: Awaited<ReturnType<Stagehand["context"]["newPage"]>>,
-  selector: string,
-) => {
-  try {
-    const locator = page.locator(selector).first();
-    if (
-      "isVisible" in locator &&
-      typeof (locator as { isVisible?: unknown }).isVisible === "function"
-    ) {
-      return await (locator as { isVisible: () => Promise<boolean> }).isVisible();
-    }
-  } catch {
-    return false;
-  }
-  return false;
-};
-
-const findVisibleSelector = async (
-  page: Awaited<ReturnType<Stagehand["context"]["newPage"]>>,
-  selectors: string[],
-) => {
-  for (const selector of selectors) {
-    if (await locatorVisibleNow(page, selector)) {
-      return selector;
-    }
-  }
-  return null;
-};
-
-const resultsHeadingVisible = async (
-  page: Awaited<ReturnType<Stagehand["context"]["newPage"]>>,
-) => {
-  try {
-    const locator = page
-      .locator("h1, h2, h3")
-      .filter({ hasText: /results|tires/i })
-      .first();
-    if (
-      "isVisible" in locator &&
-      typeof (locator as { isVisible?: unknown }).isVisible === "function"
-    ) {
-      return await (locator as { isVisible: () => Promise<boolean> }).isVisible();
-    }
-  } catch {
-    return false;
-  }
-  return false;
-};
-
-const waitForSearchResults = async (
-  page: Awaited<ReturnType<Stagehand["context"]["newPage"]>>,
-  timeoutMs: number,
-) => {
-  const resultSelectors = [
-    "[data-testid*='results']",
-    "[data-testid*='product']",
-    ".results",
-    ".search-results",
-    ".product-grid",
-    ".product-list",
-    ".product-card",
-    "[class*='Results']",
-    "[class*='ProductGrid']",
-  ];
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    if (await locatorCountAtLeast(page, "a[href*='/tires']", 3)) {
-      return "links:/tires";
-    }
-    const container = await findVisibleSelector(page, resultSelectors);
-    if (container) {
-      return `results_container:${container}`;
-    }
-    if (await resultsHeadingVisible(page)) {
-      return "results_heading:text";
-    }
-    await sleep(250);
-  }
-  return null;
-};
-
-const locatorCountAtLeast = async (
-  page: Awaited<ReturnType<Stagehand["context"]["newPage"]>>,
-  selector: string,
-  minCount: number,
-) => {
-  try {
-    const count = await page.locator(selector).count();
-    return count >= minCount;
-  } catch {
-    return false;
-  }
-};
-
-const waitForUrlChangeOrDom = async (
-  page: Awaited<ReturnType<Stagehand["context"]["newPage"]>>,
-  beforeUrl: string,
-  domSelector?: string,
-  timeoutMs = 15000,
-) => {
-  const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    const current = page.url();
-    if (current && current !== beforeUrl) {
-      return { reason: "url_changed" as const, url: current };
-    }
-    if (domSelector) {
-      const visible = await waitForLocatorVisible(page, domSelector, 1000);
-      if (visible) {
-        return { reason: "dom_present" as const, url: current };
+      } catch {
+        // ignore and continue polling
       }
     }
-    await new Promise((resolve) => setTimeout(resolve, 250));
-  }
-  return { reason: "timeout" as const, url: page.url() };
-};
 
-const performSearchSubmitStep2 = async (
-  stagehand: Stagehand,
-  notes: string[],
-) => {
-  try {
-    await stagehand.act("press Enter in the search box");
-    notes.push("search_submit_step2=enter");
-    return "enter";
-  } catch (error) {
-    notes.push(
-      `search_submit_step2_enter_failed=${
-        error instanceof Error ? error.message : String(error)
-      }`,
-    );
+    for (const { selector, count } of minCounts) {
+      try {
+        const found = await page.locator(selector).count();
+        if (found >= count) {
+          return `minCounts:${selector}`;
+        }
+      } catch {
+        // ignore and continue polling
+      }
+    }
+
+    await sleep(250);
   }
 
-  await stagehand.act("click the search submit icon next to the search box");
-  notes.push("search_submit_step2=search_icon");
-  return "search_icon";
+  return null;
 };
 
 process.on("unhandledRejection", (reason) =>
@@ -470,69 +383,48 @@ async function main() {
       let searchOk = false;
       for (let attempt = 0; attempt < 3; attempt += 1) {
         try {
-          const observeInstruction =
-            "Find the main search input in the site header with placeholder 'What can we help you find?' Return the clickable element for focusing the search input.";
-          const observed = (await stagehand.observe({
-            instruction: observeInstruction,
-          })) ?? [];
-          if (observed.length === 0) {
-            runNotes.push(
-              "search observe returned empty list, falling back to direct act",
-            );
-            await stagehand.act(
-              "Click the search box in the header that says 'What can we help you find?'",
-            );
-          } else {
-            let action = pickObservedAction(observed, runNotes);
-            if (!action) {
-              const refinedObserved = (await stagehand.observe({
-                instruction:
-                  "Focus the header search input with placeholder 'What can we help you find?' Ignore accessibility links and policy banners.",
-              })) ?? [];
-              if (refinedObserved.length === 0) {
-                runNotes.push(
-                  "refined search observe returned empty list, falling back to direct act",
-                );
-                await stagehand.act(
-                  "Click the search box in the header that says 'What can we help you find?'",
-                );
-              } else {
-                action = pickObservedAction(refinedObserved, runNotes);
-              }
-            }
-            if (!action) {
-              runNotes.push(
-                "search observe returned no usable actions after refinement",
-              );
-              await stagehand.act(
-                "Click the search box in the header that says 'What can we help you find?'",
-              );
-            } else {
-              await stagehand.act(action);
-            }
+          const focusResult = await observeThenAct(
+            stagehand,
+            "Focus the header search input with placeholder text 'What can we help you find?'.",
+            {
+              fallbackInstruction:
+                "Click the header search box labeled 'What can we help you find?'.",
+            },
+          );
+          runNotes.push(...focusResult.notes);
+          if (!focusResult.ok) {
+            throw new BlockedError("search focus failed");
           }
-          const fillObserved = (await stagehand.observe({
-            instruction: `Type "${searchQuery}" into the search input`,
-          })) ?? [];
-          const fillAction = pickObservedAction(fillObserved, runNotes);
-          if (!fillAction) {
-            runNotes.push("search fill observe returned no usable actions");
-            await stagehand.act(
-              `Type "${searchQuery}" into the search input`,
-            );
-            await performSearchSubmitStep2(stagehand, runNotes);
-          } else {
-            await stagehand.act(fillAction);
-            const method = (fillAction as { method?: string }).method?.toLowerCase();
-            if (method === "fill" || method === "type") {
-              const twoStep = (fillAction as { twoStep?: boolean }).twoStep === true;
-              if (twoStep) {
-                runNotes.push("search_fill_two_step=true");
-              }
-              await performSearchSubmitStep2(stagehand, runNotes);
-            }
+
+          const typeResult = await observeThenAct(
+            stagehand,
+            `Type "${searchQuery}" into the header search input.`,
+            {
+              fallbackInstruction: `Type "${searchQuery}" into the header search input and press Enter.`,
+            },
+          );
+          runNotes.push(...typeResult.notes);
+          if (!typeResult.ok) {
+            throw new BlockedError("search typing failed");
           }
-          const searchResultReason = await waitForSearchResults(page, 15000);
+
+          const searchResultReason = await waitForState(page, {
+            selectorsAny: [
+              "[data-testid*='results']",
+              "[data-testid*='product']",
+              ".results",
+              ".search-results",
+              ".product-grid",
+              ".product-list",
+              ".product-card",
+              "[class*='Results']",
+              "[class*='ProductGrid']",
+              "text=/results/i",
+              "text=/tires/i",
+            ],
+            minCounts: [{ selector: "a[href*='/tires']", count: 3 }],
+            timeoutMs: 15000,
+          });
           searchOk = Boolean(searchResultReason);
           runNotes.push(
             searchResultReason
@@ -583,7 +475,7 @@ async function main() {
         stagehand.extract({
           schema: resultsSchema,
           instruction:
-            "From the search results product cards, extract a list with product name, product URL, the marketed price text, and any qualifiers like per-tire or rebates.",
+            "From the search results product cards, extract product name, product URL, the marketed price text, and qualifiers like per-tire or rebates.",
         }),
       );
     } catch (error) {
@@ -651,7 +543,7 @@ async function main() {
         seen.add(key);
         return true;
       })
-      .slice(0, 3);
+      .slice(0, 30);
 
     if (candidates.length === 0) {
       runNotes.push("no unique search results found");
@@ -676,7 +568,16 @@ async function main() {
       return;
     }
 
+    const SUCCESS_TARGET = 5;
+    const MAX_ATTEMPTS = 30;
+    let successCount = 0;
+    let attempts = 0;
+
     for (const candidate of candidates) {
+      if (successCount >= SUCCESS_TARGET || attempts >= MAX_ATTEMPTS) {
+        break;
+      }
+      attempts += 1;
       const notes: string[] = [];
       let cartExtraction: CartExtraction = {
         final_total_text: null,
@@ -691,41 +592,62 @@ async function main() {
             await sleep(1500);
           });
           await retryStep("add to cart", async () => {
-            const beforeUrl = page.url();
-            await observeAndAct(
+            const addResult = await observeThenAct(
               stagehand,
-              page,
-              "Click the primary 'Add to cart' or equivalent purchase button for this tire without selecting paid add-ons.",
-              notes,
+              "Click the primary 'Add to cart' button for this tire product page. Avoid optional protection add-ons.",
+              {
+                fallbackInstruction:
+                  "Click the main Add to cart button on the product page without selecting add-ons.",
+              },
             );
-            const transition = await waitForUrlChangeOrDom(
-              page,
-              beforeUrl,
-              "[data-testid='cart-drawer'], .cart-drawer, #cart-drawer, [aria-label='Cart'], text=/added to cart/i",
-              15000,
-            );
-            notes.push(`add_to_cart transition=${transition.reason}`);
-            if (transition.reason === "timeout") {
+            notes.push(...addResult.notes);
+            if (!addResult.ok) {
+              throw new BlockedError("add_to_cart action failed");
+            }
+            const transition = await waitForState(page, {
+              selectorsAny: [
+                "[data-testid='cart-drawer']",
+                ".cart-drawer",
+                "#cart-drawer",
+                "[aria-label='Cart']",
+                "text=/added to cart/i",
+                "text=/cart/i",
+              ],
+              timeoutMs: 15000,
+            });
+            notes.push(`add_to_cart transition=${transition ?? "timeout"}`);
+            if (!transition) {
               throw new BlockedError("add_to_cart transition timed out");
             }
           });
 
           await retryStep("open cart", async () => {
-            const beforeUrl = page.url();
-            await observeAndAct(
+            const openResult = await observeThenAct(
               stagehand,
-              page,
-              "Open the cart or checkout review page that shows totals without submitting payment.",
-              notes,
+              "Open the cart drawer or cart page that shows totals without submitting payment.",
+              {
+                fallbackInstruction:
+                  "Open the cart drawer or cart page showing totals.",
+              },
             );
-            const transition = await waitForUrlChangeOrDom(
-              page,
-              beforeUrl,
-              "h1:has-text('Cart'), h2:has-text('Cart'), [data-testid='cart-drawer'], .cart-drawer, #cart-drawer, [aria-label='Cart']",
-              15000,
-            );
-            notes.push(`open_cart transition=${transition.reason}`);
-            if (transition.reason === "timeout") {
+            notes.push(...openResult.notes);
+            if (!openResult.ok) {
+              throw new BlockedError("open_cart action failed");
+            }
+            const transition = await waitForState(page, {
+              selectorsAny: [
+                "h1:has-text('Cart')",
+                "h2:has-text('Cart')",
+                "[data-testid='cart-drawer']",
+                ".cart-drawer",
+                "#cart-drawer",
+                "[aria-label='Cart']",
+                "text=/cart/i",
+              ],
+              timeoutMs: 15000,
+            });
+            notes.push(`open_cart transition=${transition ?? "timeout"}`);
+            if (!transition) {
               throw new BlockedError("open_cart transition timed out");
             }
           });
@@ -799,6 +721,7 @@ async function main() {
         };
 
         await appendOutput(record);
+        successCount += 1;
       } catch (error) {
         const normalized = formatErrorNotes(notes, error);
         console.error("product loop failed", normalized);
@@ -815,7 +738,7 @@ async function main() {
           sessionUrl,
           debugUrl,
           sessionId,
-          status: "blocked",
+          status: normalized instanceof BlockedError ? "blocked" : "failed",
           notes: notes.join(" | "),
         });
       }
