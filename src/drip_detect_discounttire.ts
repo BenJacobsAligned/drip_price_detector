@@ -115,6 +115,36 @@ const retryStep = async <T>(label: string, action: () => Promise<T>) => {
   );
 };
 
+const isBlockedObservedAction = (description: string) => {
+  const lowered = description.toLowerCase();
+  return [
+    "usablenet",
+    "tire price guide",
+    "send to phone",
+    "schedule appointment",
+  ].some((phrase) => lowered.includes(phrase));
+};
+
+const pickObservedAction = (observed: unknown[], notes: string[]) => {
+  const actions = asArray<{ selector?: string; description?: string }>(observed);
+  if (actions.length === 0) {
+    return null;
+  }
+  const filtered = actions.filter(
+    (action) =>
+      !action.description || !isBlockedObservedAction(action.description),
+  );
+  if (filtered.length === 0) {
+    notes.push(
+      `observe returned only blocked actions: ${actions
+        .map((action) => action.description ?? "unknown")
+        .join(", ")}`,
+    );
+    return null;
+  }
+  return filtered[0];
+};
+
 const observeAndAct = async (
   stagehand: Stagehand,
   page: Awaited<ReturnType<Stagehand["context"]["newPage"]>>,
@@ -122,15 +152,14 @@ const observeAndAct = async (
   notes: string[],
 ) => {
   const observed = (await stagehand.observe({ instruction })) ?? [];
-  const actions = asArray<unknown>(observed);
+  const action = pickObservedAction(observed, notes);
 
-  if (actions.length === 0) {
-    notes.push(`observe returned no actions for: ${instruction}`);
+  if (!action) {
+    notes.push(`observe returned no usable actions for: ${instruction}`);
     await stagehand.act(`Perform the action described: ${instruction}`);
     return false;
   }
 
-  const action = actions[0] as { selector?: string };
   try {
     const result = await stagehand.act(action);
     if (result && typeof result === "object" && "success" in result) {
@@ -154,6 +183,90 @@ const observeAndAct = async (
   return true;
 };
 
+const waitForLocatorVisible = async (
+  page: Awaited<ReturnType<Stagehand["context"]["newPage"]>>,
+  selector: string,
+  timeoutMs: number,
+) => {
+  const locator = page.locator(selector).first();
+  if (
+    "waitFor" in locator &&
+    typeof (locator as { waitFor?: unknown }).waitFor === "function"
+  ) {
+    try {
+      await (
+        locator as {
+          waitFor: (opts?: { state?: "visible"; timeout?: number }) => Promise<void>;
+        }
+      ).waitFor({ state: "visible", timeout: timeoutMs });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      if (
+        "count" in locator &&
+        typeof (locator as { count?: unknown }).count === "function"
+      ) {
+        const count = await (locator as { count: () => Promise<number> }).count();
+        if (count > 0) {
+          return true;
+        }
+      } else if (selector.startsWith("text=") || selector.startsWith("text=/")) {
+        const content = await page.textContent("body");
+        if (content && content.match(/results/i)) {
+          return true;
+        }
+      }
+    } catch {
+      // ignore and continue polling
+    }
+    await sleep(250);
+  }
+  return false;
+};
+
+const waitForAny = async (
+  checks: Array<() => Promise<boolean>>,
+  timeoutMs: number,
+) => {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    for (const check of checks) {
+      if (await check()) {
+        return true;
+      }
+    }
+    await sleep(250);
+  }
+  return false;
+};
+
+const urlChanged = async (
+  page: Awaited<ReturnType<Stagehand["context"]["newPage"]>>,
+  beforeUrl: string,
+) => {
+  const current = page.url();
+  return Boolean(current && current !== beforeUrl);
+};
+
+const locatorCountAtLeast = async (
+  page: Awaited<ReturnType<Stagehand["context"]["newPage"]>>,
+  selector: string,
+  minCount: number,
+) => {
+  try {
+    const count = await page.locator(selector).count();
+    return count >= minCount;
+  } catch {
+    return false;
+  }
+};
+
 const waitForUrlChangeOrDom = async (
   page: Awaited<ReturnType<Stagehand["context"]["newPage"]>>,
   beforeUrl: string,
@@ -167,28 +280,9 @@ const waitForUrlChangeOrDom = async (
       return { reason: "url_changed" as const, url: current };
     }
     if (domSelector) {
-      try {
-        await page.waitForLoadState("domcontentloaded");
-        const locator = page.locator(domSelector);
-        if (
-          "waitFor" in locator &&
-          typeof (locator as { waitFor?: unknown }).waitFor === "function"
-        ) {
-          await (locator as { waitFor: (opts?: { timeout?: number }) => Promise<void> }).waitFor({
-            timeout: 1000,
-          });
-        } else if (
-          "count" in locator &&
-          typeof (locator as { count?: unknown }).count === "function"
-        ) {
-          const count = await (locator as { count: () => Promise<number> }).count();
-          if (count === 0) {
-            throw new Error("dom selector not present yet");
-          }
-        }
+      const visible = await waitForLocatorVisible(page, domSelector, 1000);
+      if (visible) {
         return { reason: "dom_present" as const, url: current };
-      } catch {
-        // continue polling
       }
     }
     await new Promise((resolve) => setTimeout(resolve, 250));
@@ -287,47 +381,79 @@ async function main() {
       return;
     }
 
-    try {
-      await retryStep("search", async () => {
+    {
+      let searchOk = false;
+      for (let attempt = 0; attempt < 3; attempt += 1) {
         const beforeUrl = page.url();
-        await observeAndAct(
-          stagehand,
-          page,
-          `Find the site search input on Discount Tire, type "${searchQuery}", submit the search, and dismiss any popups that block typing if needed.`,
-          runNotes,
-        );
-        const transition = await waitForUrlChangeOrDom(
-          page,
-          beforeUrl,
-          "[data-testid='product-grid'], [data-testid='product-list'], .product-grid, .product-list, .search-results",
-          15000,
-        );
-        runNotes.push(`search_submit transition=${transition.reason}`);
-        if (transition.reason === "timeout") {
-          throw new BlockedError("search_submit transition timed out");
+        try {
+          await observeAndAct(
+            stagehand,
+            page,
+            `Click the main site search input in the header (not accessibility links), type "${searchQuery}".`,
+            runNotes,
+          );
+          await observeAndAct(
+            stagehand,
+            page,
+            "Press Enter in the search input or click the search icon next to the search field.",
+            runNotes,
+          );
+          searchOk = await waitForAny(
+            [
+              () => urlChanged(page, beforeUrl),
+              () => waitForLocatorVisible(page, "text=/Results|Search results/i", 1000),
+              () =>
+                locatorCountAtLeast(
+                  page,
+                  "a[href*='/tires/'], a[href*='/tires-and-wheels/']",
+                  3,
+                ),
+              () =>
+                waitForLocatorVisible(
+                  page,
+                  "[data-testid*='results'], [class*='results'], [class*='product']",
+                  1000,
+                ),
+            ],
+            15000,
+          );
+          runNotes.push(`search_submit ok=${searchOk}`);
+          if (searchOk) {
+            break;
+          }
+        } catch (error) {
+          runNotes.push(
+            `search attempt ${attempt + 1} error=${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
         }
-      });
-    } catch (error) {
-      const normalized = formatErrorNotes(runNotes, error);
-      console.error("search failed", normalized);
-      await appendOutput({
-        timestamp: new Date().toISOString(),
-        ...baseOutput,
-        product_name: null,
-        product_url: null,
-        initial_price_text: null,
-        qualifiers: null,
-        final_total_text: null,
-        fee_lines: [],
-        line_items: [],
-        sessionUrl,
-        debugUrl,
-        sessionId,
-        status: normalized instanceof BlockedError ? "blocked" : "failed",
-        notes: runNotes.join(" | "),
-      });
-      process.exitCode = 1;
-      return;
+        if (attempt < 2) {
+          await sleep(1000);
+        }
+      }
+
+      if (!searchOk) {
+        runNotes.push("search_submit timed out waiting for results DOM");
+        await appendOutput({
+          timestamp: new Date().toISOString(),
+          ...baseOutput,
+          product_name: null,
+          product_url: null,
+          initial_price_text: null,
+          qualifiers: null,
+          final_total_text: null,
+          fee_lines: [],
+          line_items: [],
+          sessionUrl,
+          debugUrl,
+          sessionId,
+          status: "blocked",
+          notes: runNotes.join(" | "),
+        });
+        process.exitCode = 1;
+        return;
+      }
     }
 
     let results: z.infer<typeof resultsSchema> | null = null;
