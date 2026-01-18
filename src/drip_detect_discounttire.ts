@@ -118,9 +118,22 @@ const retryStep = async <T>(label: string, action: () => Promise<T>) => {
   );
 };
 
-const observeAndAct = async (instruction: string) => {
-  const observedAction = await stagehand.observe({ instruction });
-  await stagehand.act(observedAction);
+const observeAndAct = async (instruction: string, notes: string[]) => {
+  const observed = await stagehand.observe({ instruction });
+  const actions = Array.isArray(observed)
+    ? observed
+    : observed
+      ? [observed]
+      : [];
+
+  if (!actions[0]) {
+    notes.push(`observe returned no actions for: ${instruction}`);
+    await stagehand.act(`Perform the action described: ${instruction}`);
+    return false;
+  }
+
+  await stagehand.act(actions[0]);
+  return true;
 };
 
 const baseOutput = {
@@ -132,6 +145,8 @@ await stagehand.init();
 const sessionUrl = stagehand.sessionUrl;
 const debugUrl = stagehand.debugUrl;
 const sessionId = stagehand.sessionId;
+const runNotes: string[] = [];
+let runBlocked = false;
 
 try {
   const page =
@@ -147,9 +162,13 @@ try {
   });
 
   await retryStep("search", async () => {
-    await observeAndAct(
+    const observed = await observeAndAct(
       `Find the site search input on Discount Tire, type "${searchQuery}", submit the search, and dismiss any popups that block typing if needed.`,
+      runNotes,
     );
+    if (!observed) {
+      runBlocked = true;
+    }
     await sleep(1500);
   });
 
@@ -185,7 +204,8 @@ try {
 
   for (const candidate of candidates) {
     let status: OutputRecord["status"] = "ok";
-    let notes: string | null = null;
+    const notes: string[] = [];
+    let observedBlocked = false;
     let cartExtraction: CartExtraction = {
       final_total_text: null,
       fee_lines: [],
@@ -199,16 +219,24 @@ try {
       });
 
       await retryStep("add to cart", async () => {
-        await observeAndAct(
+        const observed = await observeAndAct(
           "Click the primary 'Add to cart' or equivalent purchase button for this tire without selecting paid add-ons.",
+          notes,
         );
+        if (!observed) {
+          observedBlocked = true;
+        }
         await sleep(1500);
       });
 
       await retryStep("open cart", async () => {
-        await observeAndAct(
+        const observed = await observeAndAct(
           "Open the cart or checkout review page that shows totals without submitting payment.",
+          notes,
         );
+        if (!observed) {
+          observedBlocked = true;
+        }
         await sleep(1500);
       });
 
@@ -220,8 +248,12 @@ try {
         }),
       );
     } catch (error) {
-      status = classifyStatus(error);
-      notes = error instanceof Error ? error.message : String(error);
+      status = observedBlocked ? "blocked" : classifyStatus(error);
+      notes.push(error instanceof Error ? error.message : String(error));
+    }
+
+    if (observedBlocked && status === "ok") {
+      status = "blocked";
     }
 
     const record: OutputRecord = {
@@ -238,12 +270,16 @@ try {
       debugUrl,
       sessionId,
       status,
-      notes,
+      notes: notes.length > 0 ? notes.join(" | ") : null,
     };
 
     await appendOutput(record);
   }
 } catch (error) {
+  if (runNotes.length > 0) {
+    runNotes.push(error instanceof Error ? error.message : String(error));
+  }
+
   const record: OutputRecord = {
     timestamp: new Date().toISOString(),
     ...baseOutput,
@@ -257,8 +293,13 @@ try {
     sessionUrl,
     debugUrl,
     sessionId,
-    status: classifyStatus(error),
-    notes: error instanceof Error ? error.message : String(error),
+    status: runBlocked ? "blocked" : classifyStatus(error),
+    notes:
+      runNotes.length > 0
+        ? runNotes.join(" | ")
+        : error instanceof Error
+          ? error.message
+          : String(error),
   };
 
   await appendOutput(record);
