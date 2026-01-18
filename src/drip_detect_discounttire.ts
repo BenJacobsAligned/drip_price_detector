@@ -221,6 +221,8 @@ const observeThenAct = async (
 type WaitForStateOptions = {
   selectorsAny?: string[];
   minCounts?: { selector: string; count: number }[];
+  requireUrlChangeFrom?: string;
+  urlIncludesAny?: string[];
   timeoutMs?: number;
 };
 
@@ -230,10 +232,29 @@ const waitForState = async (
 ) => {
   const selectorsAny = options.selectorsAny ?? [];
   const minCounts = options.minCounts ?? [];
+  const requireUrlChangeFrom = options.requireUrlChangeFrom;
+  const urlIncludesAny = options.urlIncludesAny ?? [];
   const timeoutMs = options.timeoutMs ?? 15000;
   const start = Date.now();
 
   while (Date.now() - start < timeoutMs) {
+    if (requireUrlChangeFrom) {
+      try {
+        if (page.url() !== requireUrlChangeFrom) {
+          return "urlChanged";
+        }
+      } catch {
+        // ignore and continue polling
+      }
+    }
+
+    if (urlIncludesAny.length > 0) {
+      const currentUrl = page.url();
+      if (urlIncludesAny.some((fragment) => currentUrl.includes(fragment))) {
+        return "urlIncludes";
+      }
+    }
+
     for (const selector of selectorsAny) {
       if (selector.startsWith("text=") || selector.startsWith("text=/")) {
         try {
@@ -286,6 +307,69 @@ const waitForState = async (
   }
 
   return null;
+};
+
+const productCardSelector =
+  "[data-testid*='product'], .product-card, [class*='ProductCard']";
+const searchResultSelectors = [
+  productCardSelector,
+  "[data-testid*='results']",
+  ".search-results",
+  ".product-grid",
+  ".product-list",
+  "[class*='ProductGrid']",
+];
+
+const attemptSearch = async (
+  page: Awaited<ReturnType<Stagehand["context"]["newPage"]>>,
+  stagehand: Stagehand,
+  searchQuery: string,
+  runNotes: string[],
+) => {
+  const initialUrl = page.url();
+  const searchInput = page
+    .getByPlaceholder("What can we help you find?")
+    .first();
+
+  try {
+    await searchInput.waitFor({ state: "visible", timeout: 5000 });
+    await searchInput.click({ timeout: 3000 });
+    await searchInput.fill(searchQuery, { timeout: 3000 });
+    await searchInput.press("Enter", { timeout: 3000 });
+    runNotes.push("search_submit=playwright_input");
+  } catch (error) {
+    runNotes.push(
+      `search_submit_playwright_failed=${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+    await stagehand.act(
+      `Click the main header search input with placeholder "What can we help you find?", type "${searchQuery}", and press Enter.`,
+    );
+    runNotes.push("search_submit=stagehand_fallback");
+  }
+
+  const urlChangeReason = await waitForState(page, {
+    requireUrlChangeFrom: initialUrl,
+    timeoutMs: 15000,
+  });
+
+  if (!urlChangeReason) {
+    runNotes.push("search_submit_url_timeout");
+    return false;
+  }
+
+  const resultsReason = await waitForState(page, {
+    selectorsAny: searchResultSelectors,
+    minCounts: [{ selector: productCardSelector, count: 1 }],
+    timeoutMs: 15000,
+  });
+  runNotes.push(
+    resultsReason
+      ? `search_submit_results=${resultsReason}`
+      : "search_submit_results_timeout",
+  );
+  return Boolean(resultsReason);
 };
 
 process.on("unhandledRejection", (reason) =>
@@ -376,151 +460,60 @@ async function main() {
       return;
     }
 
-    {
-      let searchOk = false;
-      for (let attempt = 0; attempt < 3; attempt += 1) {
-        try {
-          const fallbackInstruction = `Click the main header search input with placeholder "What can we help you find?", type "${searchQuery}", and press Enter.`;
-          let observedActions: {
-            description?: string;
-            method?: string;
-            twoStep?: boolean;
-          }[] = [];
-          try {
-            const observed =
-              (await stagehand.observe({
-                instruction:
-                  "Find the main header search input with placeholder 'What can we help you find?'.",
-              })) ?? [];
-            observedActions = asArray<{
-              description?: string;
-              method?: string;
-              twoStep?: boolean;
-            }>(observed);
-          } catch (error) {
-            runNotes.push(
-              `search_observe_failed=${
-                error instanceof Error ? error.message : String(error)
-              }`,
-            );
+    let results: z.infer<typeof resultsSchema> | null = null;
+    let productsArr: z.infer<typeof resultsSchema>["products"] = [];
+    let searchOk = false;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        const searchSucceeded = await attemptSearch(
+          page,
+          stagehand,
+          searchQuery,
+          runNotes,
+        );
+        if (!searchSucceeded) {
+          runNotes.push(`search_attempt_failed=${attempt + 1}`);
+          if (attempt < 2) {
+            await sleep(1000);
+            continue;
           }
-
-          const filteredActions = observedActions.filter(
-            (action) =>
-              !action.description ||
-              !blockedActionDescriptionRegex.test(action.description),
-          );
-
-          if (filteredActions.length > 0) {
-            const action = filteredActions[0];
-            const actionDescription = action.description ?? "missing description";
-            runNotes.push(`search_observe_action=${actionDescription}`);
-            console.info("search observe action", actionDescription);
-            try {
-              await stagehand.act(action);
-            } catch (error) {
-              runNotes.push(
-                `search_observe_act_failed=${
-                  error instanceof Error ? error.message : String(error)
-                }`,
-              );
-              await stagehand.act(fallbackInstruction);
-            }
-          } else {
-            runNotes.push("search_observe_empty_or_filtered");
-            await stagehand.act(fallbackInstruction);
-          }
-
-          try {
-            await stagehand.act(
-              `Type "${searchQuery}" and press Enter in the focused input.`,
-            );
-          } catch (error) {
-            runNotes.push(
-              `search_submit_failed=${
-                error instanceof Error ? error.message : String(error)
-              }`,
-            );
-            await stagehand.act("Click the search icon if present");
-          }
-
-          const searchResultReason = await waitForState(page, {
-            selectorsAny: [
-              "[data-testid*='results']",
-              "[data-testid*='product']",
-              ".results",
-              ".search-results",
-              ".product-grid",
-              ".product-list",
-              ".product-card",
-              "[class*='Results']",
-              "[class*='ProductGrid']",
-              "h1:has-text('Results')",
-              "h2:has-text('Results')",
-              "text=/results/i",
-              "text=/tires/i",
-            ],
-            minCounts: [{ selector: "a[href*='/tires']", count: 3 }],
-            timeoutMs: 15000,
-          });
-          searchOk = Boolean(searchResultReason);
-          runNotes.push(
-            searchResultReason
-              ? `search_submit success=${searchResultReason}`
-              : "search_submit timeout",
-          );
-          if (searchResultReason) {
-            console.info("search success", searchResultReason);
-          }
-          if (searchOk) {
-            break;
-          }
-        } catch (error) {
-          runNotes.push(
-            `search attempt ${attempt + 1} error=${
-              error instanceof Error ? error.message : String(error)
-            }`,
-          );
+          break;
         }
-        if (attempt < 2) {
-          await sleep(1000);
+
+        results = await retryStep("extract results", async () =>
+          stagehand.extract({
+            schema: resultsSchema,
+            instruction:
+              "From the search results product cards, extract product name, product URL, the marketed price text, and qualifiers like per-tire or rebates.",
+          }),
+        );
+        productsArr = asArray<
+          z.infer<typeof resultsSchema>["products"][number]
+        >(results?.products);
+        if (productsArr.length > 0) {
+          searchOk = true;
+          break;
         }
+        runNotes.push(
+          `search_attempt_no_products_extracted=${attempt + 1}`,
+        );
+      } catch (error) {
+        runNotes.push(
+          `search attempt ${attempt + 1} error=${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
       }
 
-      if (!searchOk) {
-        runNotes.push("search_submit_dom_timeout");
-        await appendOutput({
-          timestamp: new Date().toISOString(),
-          ...baseOutput,
-          product_name: null,
-          product_url: null,
-          initial_price_text: null,
-          qualifiers: null,
-          final_total_text: null,
-          fee_lines: [],
-          line_items: [],
-          sessionUrl,
-          debugUrl,
-          sessionId,
-          status: "blocked",
-          notes: runNotes.join(" | "),
-        });
-        return;
+      if (attempt < 2) {
+        await sleep(1000);
+        await page.goto("https://www.discounttire.com/", { waitUntil: "load" });
+        await sleep(1500);
       }
     }
 
-    let results: z.infer<typeof resultsSchema> | null = null;
-    try {
-      results = await retryStep("extract results", async () =>
-        stagehand.extract({
-          schema: resultsSchema,
-          instruction:
-            "From the search results product cards, extract product name, product URL, the marketed price text, and qualifiers like per-tire or rebates.",
-        }),
-      );
-    } catch (error) {
-      const normalized = formatErrorNotes(runNotes, error);
-      console.error("pick products failed", normalized);
+    if (!searchOk) {
+      runNotes.push("search_submit_failed_or_empty");
       await appendOutput({
         timestamp: new Date().toISOString(),
         ...baseOutput,
@@ -537,31 +530,6 @@ async function main() {
         status: "blocked",
         notes: runNotes.join(" | "),
       });
-      return;
-    }
-
-    const productsArr = asArray<
-      z.infer<typeof resultsSchema>["products"][number]
-    >(results?.products);
-    if (productsArr.length === 0) {
-      runNotes.push("no search results extracted");
-      const record: OutputRecord = {
-        timestamp: new Date().toISOString(),
-        ...baseOutput,
-        product_name: null,
-        product_url: null,
-        initial_price_text: null,
-        qualifiers: null,
-        final_total_text: null,
-        fee_lines: [],
-        line_items: [],
-        sessionUrl,
-        debugUrl,
-        sessionId,
-        status: "blocked",
-        notes: runNotes.join(" | "),
-      };
-      await appendOutput(record);
       return;
     }
 
