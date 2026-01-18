@@ -21,7 +21,10 @@ const stagehand = new Stagehand({
   model: "google/gemini-2.5-flash",
 });
 
-const { debugUrl, sessionUrl } = await stagehand.init();
+await stagehand.init();
+const sessionUrl = stagehand.sessionUrl;
+const debugUrl = stagehand.debugUrl;
+const sessionId = stagehand.sessionId;
 
 try {
   const page =
@@ -52,6 +55,7 @@ try {
     targetUrl,
     sessionUrl,
     debugUrl,
+    sessionId,
     extraction,
   });
   await appendFile(outputFile, `${line}\n`, "utf8");
