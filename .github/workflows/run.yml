@@ -8,6 +8,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       BROWSERBASE_API_KEY: ${{ secrets.BROWSERBASE_API_KEY }}
+      BROWSERBASE_CONFIG_DIR: ${{ github.workspace }}/.browserbase
       BROWSERBASE_PROJECT_ID: ${{ secrets.BROWSERBASE_PROJECT_ID }}
       GOOGLE_GENERATIVE_AI_API_KEY: ${{ secrets.GOOGLE_GENERATIVE_AI_API_KEY }}
       TARGET_URL: https://example.com
@@ -26,9 +27,13 @@ jobs:
       - name: Run Stagehand
         run: npm run run:discounttire
 
-      - name: Upload output artifact
+      - name: Upload debug artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: drip-price-output
-          path: runs/output.jsonl
+          name: drip-price-debug
+          path: |
+            runs/output.jsonl
+            .browserbase/**
+          if-no-files-found: warn
           retention-days: 7
