@@ -24,6 +24,8 @@ const page =
   stagehand.context.pages()[0] ??
   (await stagehand.context.newPage());
 
+await stagehand.context.setActivePage(page);
+
 try {
   await page.goto("https://example.com", { waitUntil: "load" });
 
@@ -32,7 +34,7 @@ try {
     heading: z.string(),
   });
 
-  const data = await page.extract({
+  const data = await stagehand.extract({
     schema,
     instruction: "Extract the page title and the main heading.",
   });
