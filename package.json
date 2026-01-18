@@ -8,7 +8,8 @@
   },
   "scripts": {
     "run:once": "tsx src/run_once.ts",
-    "run:target": "tsx src/run_one_target.ts"
+    "run:target": "tsx src/run_one_target.ts",
+    "run:discounttire": "tsx src/drip_detect_discounttire.ts"
   },
   "dependencies": {
     "@browserbasehq/stagehand": "^3.0.0",
