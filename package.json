@@ -7,7 +7,8 @@
     "node": ">=20"
   },
   "scripts": {
-    "run:once": "tsx src/run_once.ts"
+    "run:once": "tsx src/run_once.ts",
+    "run:target": "node --loader tsx src/run_one_target.ts"
   },
   "dependencies": {
     "@browserbasehq/stagehand": "^3.0.0",
