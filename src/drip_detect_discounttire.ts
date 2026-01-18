@@ -62,17 +62,20 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const asArray = <T,>(value: unknown): T[] =>
   Array.isArray(value) ? (value as T[]) : [];
 
-const classifyStatus = (error: unknown): "failed" | "blocked" => {
-  const message = error instanceof Error ? error.message.toLowerCase() : "";
-  if (message.includes("captcha") || message.includes("blocked")) {
-    return "blocked";
-  }
-  return "failed";
-};
-
 const appendOutput = async (record: OutputRecord) => {
   await mkdir(runsDir, { recursive: true });
   await appendFile(outputFile, `${JSON.stringify(record)}\n`, "utf8");
+};
+
+const formatErrorNotes = (notes: string[], error: unknown) => {
+  const normalized =
+    error instanceof Error
+      ? error
+      : new Error(typeof error === "string" ? error : String(error));
+  notes.push(`error.name=${normalized.name}`);
+  notes.push(`error.message=${normalized.message}`);
+  notes.push(`error.stack=${normalized.stack ?? "missing stack"}`);
+  return normalized;
 };
 
 const normalizeUrl = (href: string) => {
@@ -102,7 +105,11 @@ const retryStep = async <T>(label: string, action: () => Promise<T>) => {
   );
 };
 
-const observeAndAct = async (instruction: string, notes: string[]) => {
+const observeAndAct = async (
+  stagehand: Stagehand,
+  instruction: string,
+  notes: string[],
+) => {
   const observed = (await stagehand.observe({ instruction })) ?? [];
   const actions = asArray<unknown>(observed);
 
@@ -115,6 +122,13 @@ const observeAndAct = async (instruction: string, notes: string[]) => {
   await stagehand.act(actions[0]);
   return true;
 };
+
+process.on("unhandledRejection", (reason) =>
+  console.error("unhandledRejection", reason),
+);
+process.on("uncaughtException", (err) =>
+  console.error("uncaughtException", err),
+);
 
 async function main() {
   const googleApiKey =
@@ -140,14 +154,16 @@ async function main() {
     cacheDir: ".stagehand_cache",
   });
 
-  await stagehand.init();
-  const sessionUrl = stagehand.sessionUrl;
-  const debugUrl = stagehand.debugUrl;
-  const sessionId = stagehand.sessionId;
+  let sessionUrl: string | undefined;
+  let debugUrl: string | undefined;
+  let sessionId: string | undefined;
   const runNotes: string[] = [];
-  let runBlocked = false;
-
   try {
+    await stagehand.init();
+    sessionUrl = stagehand.sessionUrl;
+    debugUrl = stagehand.debugUrl;
+    sessionId = stagehand.sessionId;
+
     const page =
       stagehand.context.activePage() ??
       stagehand.context.pages()[0] ??
@@ -155,29 +171,97 @@ async function main() {
 
     await stagehand.context.setActivePage(page);
 
-    await retryStep("navigate home", async () => {
-      await page.goto("https://www.discounttire.com/", { waitUntil: "load" });
-      await sleep(1500);
-    });
+    try {
+      await retryStep("navigate home", async () => {
+        await page.goto("https://www.discounttire.com/", { waitUntil: "load" });
+        await sleep(1500);
+      });
+    } catch (error) {
+      const normalized = formatErrorNotes(runNotes, error);
+      console.error("navigate failed", normalized);
+      await appendOutput({
+        timestamp: new Date().toISOString(),
+        ...baseOutput,
+        product_name: null,
+        product_url: null,
+        initial_price_text: null,
+        qualifiers: null,
+        final_total_text: null,
+        fee_lines: [],
+        line_items: [],
+        sessionUrl,
+        debugUrl,
+        sessionId,
+        status: "failed",
+        notes: runNotes.join(" | "),
+      });
+      process.exitCode = 1;
+      return;
+    }
 
-    await retryStep("search", async () => {
-      const observed = await observeAndAct(
-        `Find the site search input on Discount Tire, type "${searchQuery}", submit the search, and dismiss any popups that block typing if needed.`,
-        runNotes,
+    try {
+      await retryStep("search", async () => {
+        await observeAndAct(
+          stagehand,
+          `Find the site search input on Discount Tire, type "${searchQuery}", submit the search, and dismiss any popups that block typing if needed.`,
+          runNotes,
+        );
+        await sleep(1500);
+      });
+    } catch (error) {
+      const normalized = formatErrorNotes(runNotes, error);
+      console.error("search failed", normalized);
+      await appendOutput({
+        timestamp: new Date().toISOString(),
+        ...baseOutput,
+        product_name: null,
+        product_url: null,
+        initial_price_text: null,
+        qualifiers: null,
+        final_total_text: null,
+        fee_lines: [],
+        line_items: [],
+        sessionUrl,
+        debugUrl,
+        sessionId,
+        status: "failed",
+        notes: runNotes.join(" | "),
+      });
+      process.exitCode = 1;
+      return;
+    }
+
+    let results: z.infer<typeof resultsSchema> | null = null;
+    try {
+      results = await retryStep("extract results", async () =>
+        stagehand.extract({
+          schema: resultsSchema,
+          instruction:
+            "From the search results product cards, extract a list with product name, product URL, the marketed price text, and any qualifiers like per-tire or rebates.",
+        }),
       );
-      if (!observed) {
-        runBlocked = true;
-      }
-      await sleep(1500);
-    });
-
-    const results = await retryStep("extract results", async () =>
-      stagehand.extract({
-        schema: resultsSchema,
-        instruction:
-          "From the search results product cards, extract a list with product name, product URL, the marketed price text, and any qualifiers like per-tire or rebates.",
-      }),
-    );
+    } catch (error) {
+      const normalized = formatErrorNotes(runNotes, error);
+      console.error("pick products failed", normalized);
+      await appendOutput({
+        timestamp: new Date().toISOString(),
+        ...baseOutput,
+        product_name: null,
+        product_url: null,
+        initial_price_text: null,
+        qualifiers: null,
+        final_total_text: null,
+        fee_lines: [],
+        line_items: [],
+        sessionUrl,
+        debugUrl,
+        sessionId,
+        status: "failed",
+        notes: runNotes.join(" | "),
+      });
+      process.exitCode = 1;
+      return;
+    }
 
     const productsArr = asArray<
       z.infer<typeof resultsSchema>["products"][number]
@@ -247,9 +331,7 @@ async function main() {
     }
 
     for (const candidate of candidates) {
-      let status: OutputRecord["status"] = "ok";
       const notes: string[] = [];
-      let observedBlocked = false;
       let cartExtraction: CartExtraction = {
         final_total_text: null,
         fee_lines: [],
@@ -257,74 +339,124 @@ async function main() {
       };
 
       try {
-        await retryStep("navigate product", async () => {
-          await page.goto(candidate.product_url, { waitUntil: "load" });
-          await sleep(1500);
-        });
+        try {
+          await retryStep("navigate product", async () => {
+            await page.goto(candidate.product_url, { waitUntil: "load" });
+            await sleep(1500);
+          });
 
-        await retryStep("add to cart", async () => {
-          const observed = await observeAndAct(
-            "Click the primary 'Add to cart' or equivalent purchase button for this tire without selecting paid add-ons.",
-            notes,
+          await retryStep("add to cart", async () => {
+            await observeAndAct(
+              stagehand,
+              "Click the primary 'Add to cart' or equivalent purchase button for this tire without selecting paid add-ons.",
+              notes,
+            );
+            await sleep(1500);
+          });
+
+          await retryStep("open cart", async () => {
+            await observeAndAct(
+              stagehand,
+              "Open the cart or checkout review page that shows totals without submitting payment.",
+              notes,
+            );
+            await sleep(1500);
+          });
+        } catch (error) {
+          const normalized = formatErrorNotes(notes, error);
+          console.error("add to cart failed", normalized);
+          await appendOutput({
+            timestamp: new Date().toISOString(),
+            ...baseOutput,
+            product_name: candidate.product_name,
+            product_url: candidate.product_url,
+            initial_price_text: candidate.initial_price_text,
+            qualifiers: candidate.qualifiers,
+            final_total_text: null,
+            fee_lines: [],
+            line_items: [],
+            sessionUrl,
+            debugUrl,
+            sessionId,
+            status: "failed",
+            notes: notes.join(" | "),
+          });
+          continue;
+        }
+
+        try {
+          cartExtraction = await retryStep("extract cart", async () =>
+            stagehand.extract({
+              schema: cartSchema,
+              instruction:
+                "From the cart or checkout review, extract the final total text, any fee lines with labels and amounts, and any line items with labels and amounts.",
+            }),
           );
-          if (!observed) {
-            observedBlocked = true;
-          }
-          await sleep(1500);
-        });
+        } catch (error) {
+          const normalized = formatErrorNotes(notes, error);
+          console.error("extract cart totals failed", normalized);
+          await appendOutput({
+            timestamp: new Date().toISOString(),
+            ...baseOutput,
+            product_name: candidate.product_name,
+            product_url: candidate.product_url,
+            initial_price_text: candidate.initial_price_text,
+            qualifiers: candidate.qualifiers,
+            final_total_text: null,
+            fee_lines: [],
+            line_items: [],
+            sessionUrl,
+            debugUrl,
+            sessionId,
+            status: "failed",
+            notes: notes.join(" | "),
+          });
+          continue;
+        }
 
-        await retryStep("open cart", async () => {
-          const observed = await observeAndAct(
-            "Open the cart or checkout review page that shows totals without submitting payment.",
-            notes,
-          );
-          if (!observed) {
-            observedBlocked = true;
-          }
-          await sleep(1500);
-        });
+        const record: OutputRecord = {
+          timestamp: new Date().toISOString(),
+          ...baseOutput,
+          product_name: candidate.product_name,
+          product_url: candidate.product_url,
+          initial_price_text: candidate.initial_price_text,
+          qualifiers: candidate.qualifiers,
+          final_total_text: cartExtraction.final_total_text ?? null,
+          fee_lines: cartExtraction.fee_lines ?? [],
+          line_items: cartExtraction.line_items ?? [],
+          sessionUrl,
+          debugUrl,
+          sessionId,
+          status: "ok",
+          notes: notes.length > 0 ? notes.join(" | ") : null,
+        };
 
-        cartExtraction = await retryStep("extract cart", async () =>
-          stagehand.extract({
-            schema: cartSchema,
-            instruction:
-              "From the cart or checkout review, extract the final total text, any fee lines with labels and amounts, and any line items with labels and amounts.",
-          }),
-        );
+        await appendOutput(record);
       } catch (error) {
-        status = observedBlocked ? "blocked" : classifyStatus(error);
-        notes.push(error instanceof Error ? error.message : String(error));
+        const normalized = formatErrorNotes(notes, error);
+        console.error("product loop failed", normalized);
+        await appendOutput({
+          timestamp: new Date().toISOString(),
+          ...baseOutput,
+          product_name: candidate.product_name,
+          product_url: candidate.product_url,
+          initial_price_text: candidate.initial_price_text,
+          qualifiers: candidate.qualifiers,
+          final_total_text: null,
+          fee_lines: [],
+          line_items: [],
+          sessionUrl,
+          debugUrl,
+          sessionId,
+          status: "failed",
+          notes: notes.join(" | "),
+        });
       }
-
-      if (observedBlocked && status === "ok") {
-        status = "blocked";
-      }
-
-      const record: OutputRecord = {
-        timestamp: new Date().toISOString(),
-        ...baseOutput,
-        product_name: candidate.product_name,
-        product_url: candidate.product_url,
-        initial_price_text: candidate.initial_price_text,
-        qualifiers: candidate.qualifiers,
-        final_total_text: cartExtraction.final_total_text ?? null,
-        fee_lines: cartExtraction.fee_lines ?? [],
-        line_items: cartExtraction.line_items ?? [],
-        sessionUrl,
-        debugUrl,
-        sessionId,
-        status,
-        notes: notes.length > 0 ? notes.join(" | ") : null,
-      };
-
-      await appendOutput(record);
     }
   } catch (error) {
-    if (runNotes.length > 0) {
-      runNotes.push(error instanceof Error ? error.message : String(error));
-    }
-
-    const record: OutputRecord = {
+    const normalized = formatErrorNotes(runNotes, error);
+    console.error("run failed", normalized);
+    await appendOutput({
       timestamp: new Date().toISOString(),
       ...baseOutput,
       product_name: null,
@@ -337,16 +469,9 @@ async function main() {
       sessionUrl,
       debugUrl,
       sessionId,
-      status: runBlocked ? "blocked" : classifyStatus(error),
-      notes:
-        runNotes.length > 0
-          ? runNotes.join(" | ")
-          : error instanceof Error
-            ? error.message
-            : String(error),
-    };
-
-    await appendOutput(record);
+      status: "failed",
+      notes: runNotes.join(" | "),
+    });
     process.exitCode = 1;
   } finally {
     await stagehand.close();
@@ -354,6 +479,6 @@ async function main() {
 }
 
 main().catch((error) => {
-  console.error(error);
+  console.error("FATAL", error);
   process.exit(1);
 });
