@@ -19,15 +19,20 @@ const stagehand = new Stagehand({
 
 await stagehand.init();
 
+const page =
+  stagehand.context.activePage() ??
+  stagehand.context.pages()[0] ??
+  (await stagehand.context.newPage());
+
 try {
-  await stagehand.page.goto("https://example.com", { waitUntil: "load" });
+  await page.goto("https://example.com", { waitUntil: "load" });
 
   const schema = z.object({
     title: z.string(),
     heading: z.string(),
   });
 
-  const data = await stagehand.page.extract({
+  const data = await page.extract({
     schema,
     instruction: "Extract the page title and the main heading.",
   });
