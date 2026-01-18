@@ -154,53 +154,46 @@ const observeAndAct = async (
   return true;
 };
 
-type DomSignal = {
-  name: string;
-  selector: string;
-};
-
-const waitForTransition = async (
+const waitForUrlChangeOrDom = async (
   page: Awaited<ReturnType<Stagehand["context"]["newPage"]>>,
-  label: string,
-  notes: string[],
-  domSignals: DomSignal[],
-  timeoutMs = 10000,
+  beforeUrl: string,
+  domSelector?: string,
+  timeoutMs = 15000,
 ) => {
-  const startUrl = page.url();
-  const urlPromise = page
-    .waitForURL((url) => url.toString() !== startUrl, {
-      timeout: timeoutMs,
-    })
-    .then(() => ({ type: "url_changed" as const }));
-
-  const domPromise = Promise.any(
-    domSignals.map((signal) =>
-      page
-        .waitForSelector(signal.selector, {
-          state: "visible",
-          timeout: timeoutMs,
-        })
-        .then(() => ({ type: "dom_changed" as const, name: signal.name })),
-    ),
-  );
-
-  const timeoutPromise = new Promise<never>((_, reject) => {
-    setTimeout(() => {
-      reject(
-        new BlockedError(
-          `${label} transition timed out after ${timeoutMs}ms`,
-        ),
-      );
-    }, timeoutMs);
-  });
-
-  const result = await Promise.race([urlPromise, domPromise, timeoutPromise]);
-  if (result.type === "url_changed") {
-    notes.push(`${label} transition=url_changed`);
-  } else {
-    notes.push(`${label} transition=dom_changed:${result.name}`);
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const current = page.url();
+    if (current && current !== beforeUrl) {
+      return { reason: "url_changed" as const, url: current };
+    }
+    if (domSelector) {
+      try {
+        await page.waitForLoadState("domcontentloaded");
+        const locator = page.locator(domSelector);
+        if (
+          "waitFor" in locator &&
+          typeof (locator as { waitFor?: unknown }).waitFor === "function"
+        ) {
+          await (locator as { waitFor: (opts?: { timeout?: number }) => Promise<void> }).waitFor({
+            timeout: 1000,
+          });
+        } else if (
+          "count" in locator &&
+          typeof (locator as { count?: unknown }).count === "function"
+        ) {
+          const count = await (locator as { count: () => Promise<number> }).count();
+          if (count === 0) {
+            throw new Error("dom selector not present yet");
+          }
+        }
+        return { reason: "dom_present" as const, url: current };
+      } catch {
+        // continue polling
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
   }
-  return result;
+  return { reason: "timeout" as const, url: page.url() };
 };
 
 process.on("unhandledRejection", (reason) =>
@@ -296,24 +289,23 @@ async function main() {
 
     try {
       await retryStep("search", async () => {
+        const beforeUrl = page.url();
         await observeAndAct(
           stagehand,
           page,
           `Find the site search input on Discount Tire, type "${searchQuery}", submit the search, and dismiss any popups that block typing if needed.`,
           runNotes,
         );
-        await waitForTransition(
+        const transition = await waitForUrlChangeOrDom(
           page,
-          "search_submit",
-          runNotes,
-          [
-            {
-              name: "results_grid",
-              selector:
-                "[data-testid='product-grid'], [data-testid='product-list'], .product-grid, .product-list, .search-results",
-            },
-          ],
+          beforeUrl,
+          "[data-testid='product-grid'], [data-testid='product-list'], .product-grid, .product-list, .search-results",
+          15000,
         );
+        runNotes.push(`search_submit transition=${transition.reason}`);
+        if (transition.reason === "timeout") {
+          throw new BlockedError("search_submit transition timed out");
+        }
       });
     } catch (error) {
       const normalized = formatErrorNotes(runNotes, error);
@@ -451,55 +443,44 @@ async function main() {
             await page.goto(candidate.product_url, { waitUntil: "load" });
             await sleep(1500);
           });
-
           await retryStep("add to cart", async () => {
+            const beforeUrl = page.url();
             await observeAndAct(
               stagehand,
               page,
               "Click the primary 'Add to cart' or equivalent purchase button for this tire without selecting paid add-ons.",
               notes,
             );
-            await waitForTransition(
+            const transition = await waitForUrlChangeOrDom(
               page,
-              "add_to_cart",
-              notes,
-              [
-                {
-                  name: "cart_drawer",
-                  selector:
-                    "[data-testid='cart-drawer'], .cart-drawer, #cart-drawer, [aria-label='Cart']",
-                },
-                {
-                  name: "added_to_cart_toast",
-                  selector: "text=/added to cart/i",
-                },
-              ],
+              beforeUrl,
+              "[data-testid='cart-drawer'], .cart-drawer, #cart-drawer, [aria-label='Cart'], text=/added to cart/i",
+              15000,
             );
+            notes.push(`add_to_cart transition=${transition.reason}`);
+            if (transition.reason === "timeout") {
+              throw new BlockedError("add_to_cart transition timed out");
+            }
           });
 
           await retryStep("open cart", async () => {
+            const beforeUrl = page.url();
             await observeAndAct(
               stagehand,
               page,
               "Open the cart or checkout review page that shows totals without submitting payment.",
               notes,
             );
-            await waitForTransition(
+            const transition = await waitForUrlChangeOrDom(
               page,
-              "open_cart",
-              notes,
-              [
-                {
-                  name: "cart_header",
-                  selector: "h1:has-text('Cart'), h2:has-text('Cart')",
-                },
-                {
-                  name: "cart_drawer",
-                  selector:
-                    "[data-testid='cart-drawer'], .cart-drawer, #cart-drawer, [aria-label='Cart']",
-                },
-              ],
+              beforeUrl,
+              "h1:has-text('Cart'), h2:has-text('Cart'), [data-testid='cart-drawer'], .cart-drawer, #cart-drawer, [aria-label='Cart']",
+              15000,
             );
+            notes.push(`open_cart transition=${transition.reason}`);
+            if (transition.reason === "timeout") {
+              throw new BlockedError("open_cart transition timed out");
+            }
           });
         } catch (error) {
           const normalized = formatErrorNotes(notes, error);
