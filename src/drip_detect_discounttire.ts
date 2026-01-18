@@ -78,6 +78,9 @@ type OutputRecord = {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+const asArray = <T,>(value: unknown): T[] =>
+  Array.isArray(value) ? (value as T[]) : [];
+
 const classifyStatus = (error: unknown): "failed" | "blocked" => {
   const message = error instanceof Error ? error.message.toLowerCase() : "";
   if (message.includes("captcha") || message.includes("blocked")) {
@@ -119,14 +122,10 @@ const retryStep = async <T>(label: string, action: () => Promise<T>) => {
 };
 
 const observeAndAct = async (instruction: string, notes: string[]) => {
-  const observed = await stagehand.observe({ instruction });
-  const actions = Array.isArray(observed)
-    ? observed
-    : observed
-      ? [observed]
-      : [];
+  const observed = (await stagehand.observe({ instruction })) ?? [];
+  const actions = asArray<unknown>(observed);
 
-  if (!actions[0]) {
+  if (actions.length === 0) {
     notes.push(`observe returned no actions for: ${instruction}`);
     await stagehand.act(`Perform the action described: ${instruction}`);
     return false;
@@ -180,8 +179,33 @@ try {
     }),
   );
 
+  const productsArr = asArray<z.infer<typeof resultsSchema>["products"][number]>(
+    results?.products,
+  );
+  if (productsArr.length === 0) {
+    runNotes.push("no search results extracted");
+    const record: OutputRecord = {
+      timestamp: new Date().toISOString(),
+      ...baseOutput,
+      product_name: null,
+      product_url: null,
+      initial_price_text: null,
+      qualifiers: null,
+      final_total_text: null,
+      fee_lines: [],
+      line_items: [],
+      sessionUrl,
+      debugUrl,
+      sessionId,
+      status: "blocked",
+      notes: runNotes.join(" | "),
+    };
+    await appendOutput(record);
+    return;
+  }
+
   const seen = new Set<string>();
-  const candidates = results.products
+  const candidates = productsArr
     .map((product) => ({
       ...product,
       product_url: normalizeUrl(product.product_url),
@@ -199,7 +223,25 @@ try {
     .slice(0, 3);
 
   if (candidates.length === 0) {
-    throw new Error("No product cards found in search results.");
+    runNotes.push("no unique search results found");
+    const record: OutputRecord = {
+      timestamp: new Date().toISOString(),
+      ...baseOutput,
+      product_name: null,
+      product_url: null,
+      initial_price_text: null,
+      qualifiers: null,
+      final_total_text: null,
+      fee_lines: [],
+      line_items: [],
+      sessionUrl,
+      debugUrl,
+      sessionId,
+      status: "blocked",
+      notes: runNotes.join(" | "),
+    };
+    await appendOutput(record);
+    return;
   }
 
   for (const candidate of candidates) {
