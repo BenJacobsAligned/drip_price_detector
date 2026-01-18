@@ -10,7 +10,7 @@
     "run:once": "tsx src/run_once.ts"
   },
   "dependencies": {
-    "@browserbasehq/stagehand": "^1.0.0",
+    "@browserbasehq/stagehand": "^3.0.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {
