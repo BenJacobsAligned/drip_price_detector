@@ -236,20 +236,86 @@ const waitForLocatorVisible = async (
   return false;
 };
 
-const waitForAny = async (
-  checks: Array<() => Promise<boolean>>,
+const locatorVisibleNow = async (
+  page: Awaited<ReturnType<Stagehand["context"]["newPage"]>>,
+  selector: string,
+) => {
+  try {
+    const locator = page.locator(selector).first();
+    if (
+      "isVisible" in locator &&
+      typeof (locator as { isVisible?: unknown }).isVisible === "function"
+    ) {
+      return await (locator as { isVisible: () => Promise<boolean> }).isVisible();
+    }
+  } catch {
+    return false;
+  }
+  return false;
+};
+
+const findVisibleSelector = async (
+  page: Awaited<ReturnType<Stagehand["context"]["newPage"]>>,
+  selectors: string[],
+) => {
+  for (const selector of selectors) {
+    if (await locatorVisibleNow(page, selector)) {
+      return selector;
+    }
+  }
+  return null;
+};
+
+const resultsHeadingVisible = async (
+  page: Awaited<ReturnType<Stagehand["context"]["newPage"]>>,
+) => {
+  try {
+    const locator = page
+      .locator("h1, h2, h3")
+      .filter({ hasText: /results|tires/i })
+      .first();
+    if (
+      "isVisible" in locator &&
+      typeof (locator as { isVisible?: unknown }).isVisible === "function"
+    ) {
+      return await (locator as { isVisible: () => Promise<boolean> }).isVisible();
+    }
+  } catch {
+    return false;
+  }
+  return false;
+};
+
+const waitForSearchResults = async (
+  page: Awaited<ReturnType<Stagehand["context"]["newPage"]>>,
   timeoutMs: number,
 ) => {
+  const resultSelectors = [
+    "[data-testid*='results']",
+    "[data-testid*='product']",
+    ".results",
+    ".search-results",
+    ".product-grid",
+    ".product-list",
+    ".product-card",
+    "[class*='Results']",
+    "[class*='ProductGrid']",
+  ];
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
-    for (const check of checks) {
-      if (await check()) {
-        return true;
-      }
+    if (await locatorCountAtLeast(page, "a[href*='/tires']", 3)) {
+      return "links:/tires";
+    }
+    const container = await findVisibleSelector(page, resultSelectors);
+    if (container) {
+      return `results_container:${container}`;
+    }
+    if (await resultsHeadingVisible(page)) {
+      return "results_heading:text";
     }
     await sleep(250);
   }
-  return false;
+  return null;
 };
 
 const locatorCountAtLeast = async (
@@ -286,6 +352,27 @@ const waitForUrlChangeOrDom = async (
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   return { reason: "timeout" as const, url: page.url() };
+};
+
+const performSearchSubmitStep2 = async (
+  stagehand: Stagehand,
+  notes: string[],
+) => {
+  try {
+    await stagehand.act("press Enter in the search box");
+    notes.push("search_submit_step2=enter");
+    return "enter";
+  } catch (error) {
+    notes.push(
+      `search_submit_step2_enter_failed=${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+
+  await stagehand.act("click the search submit icon next to the search box");
+  notes.push("search_submit_step2=search_icon");
+  return "search_icon";
 };
 
 process.on("unhandledRejection", (reason) =>
@@ -424,28 +511,34 @@ async function main() {
               await stagehand.act(action);
             }
           }
-          await stagehand.act(
-            `Type "${searchQuery}" into the search input and press Enter`,
+          const fillObserved = (await stagehand.observe({
+            instruction: `Type "${searchQuery}" into the search input`,
+          })) ?? [];
+          const fillAction = pickObservedAction(fillObserved, runNotes);
+          if (!fillAction) {
+            runNotes.push("search fill observe returned no usable actions");
+            await stagehand.act(
+              `Type "${searchQuery}" into the search input`,
+            );
+            await performSearchSubmitStep2(stagehand, runNotes);
+          } else {
+            await stagehand.act(fillAction);
+            const method = (fillAction as { method?: string }).method?.toLowerCase();
+            if (method === "fill" || method === "type") {
+              const twoStep = (fillAction as { twoStep?: boolean }).twoStep === true;
+              if (twoStep) {
+                runNotes.push("search_fill_two_step=true");
+              }
+              await performSearchSubmitStep2(stagehand, runNotes);
+            }
+          }
+          const searchResultReason = await waitForSearchResults(page, 15000);
+          searchOk = Boolean(searchResultReason);
+          runNotes.push(
+            searchResultReason
+              ? `search_submit success=${searchResultReason}`
+              : "search_submit timeout",
           );
-          searchOk = await waitForAny(
-            [
-              () => waitForLocatorVisible(page, "text=/Results|Search results/i", 1000),
-              () =>
-                locatorCountAtLeast(
-                  page,
-                  "a[href*='/tires/'], a[href*='/tires-and-wheels/']",
-                  3,
-                ),
-              () =>
-                waitForLocatorVisible(
-                  page,
-                  "[data-testid*='results'], [class*='results'], [class*='product']",
-                  1000,
-                ),
-            ],
-            15000,
-          );
-          runNotes.push(`search_submit ok=${searchOk}`);
           if (searchOk) {
             break;
           }
@@ -462,7 +555,7 @@ async function main() {
       }
 
       if (!searchOk) {
-        runNotes.push("search_submit timed out waiting for results DOM");
+        runNotes.push("search_submit_dom_timeout");
         await appendOutput({
           timestamp: new Date().toISOString(),
           ...baseOutput,
