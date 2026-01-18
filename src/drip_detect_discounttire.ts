@@ -289,35 +289,30 @@ const waitForState = async (
 };
 
 process.on("unhandledRejection", (reason) =>
-  console.error("unhandledRejection", reason),
+  console.error(
+    "unhandledRejection",
+    reason instanceof Error ? reason.stack ?? reason : reason,
+  ),
 );
 process.on("uncaughtException", (err) =>
-  console.error("uncaughtException", err),
+  console.error(
+    "uncaughtException",
+    err instanceof Error ? err.stack ?? err : err,
+  ),
 );
+
+let lastSessionUrl: string | undefined;
+let lastDebugUrl: string | undefined;
+let lastSessionId: string | undefined;
 
 async function main() {
   const googleApiKey =
     process.env.GOOGLE_API_KEY ?? process.env.GOOGLE_GENERATIVE_AI_API_KEY;
 
   if (!googleApiKey) {
-    const record: OutputRecord = {
-      timestamp: new Date().toISOString(),
-      site: "discounttire",
-      search_query: process.env.SEARCH_QUERY ?? "Michelin",
-      product_name: null,
-      product_url: null,
-      initial_price_text: null,
-      qualifiers: null,
-      final_total_text: null,
-      fee_lines: [],
-      line_items: [],
-      status: "blocked",
-      notes:
-        "Missing Google LLM API key. Set GOOGLE_API_KEY or GOOGLE_GENERATIVE_AI_API_KEY.",
-    };
-    await appendOutput(record);
-    process.exitCode = 1;
-    return;
+    throw new Error(
+      "Missing Google LLM API key. Set GOOGLE_API_KEY or GOOGLE_GENERATIVE_AI_API_KEY.",
+    );
   }
 
   process.env.GOOGLE_API_KEY = googleApiKey;
@@ -343,6 +338,9 @@ async function main() {
     sessionUrl = stagehand.sessionUrl;
     debugUrl = stagehand.debugUrl;
     sessionId = stagehand.sessionId;
+    lastSessionUrl = sessionUrl;
+    lastDebugUrl = debugUrl;
+    lastSessionId = sessionId;
 
     const page =
       stagehand.context.activePage() ??
@@ -375,7 +373,6 @@ async function main() {
         status: "blocked",
         notes: runNotes.join(" | "),
       });
-      process.exitCode = 1;
       return;
     }
 
@@ -508,7 +505,6 @@ async function main() {
           status: "blocked",
           notes: runNotes.join(" | "),
         });
-        process.exitCode = 1;
         return;
       }
     }
@@ -541,7 +537,6 @@ async function main() {
         status: "blocked",
         notes: runNotes.join(" | "),
       });
-      process.exitCode = 1;
       return;
     }
 
@@ -567,7 +562,6 @@ async function main() {
         notes: runNotes.join(" | "),
       };
       await appendOutput(record);
-      process.exitCode = 1;
       return;
     }
 
@@ -608,7 +602,6 @@ async function main() {
         notes: runNotes.join(" | "),
       };
       await appendOutput(record);
-      process.exitCode = 1;
       return;
     }
 
@@ -806,7 +799,6 @@ async function main() {
       status: "blocked",
       notes: runNotes.join(" | "),
     });
-    process.exitCode = 1;
   } finally {
     await stagehand.close();
   }
@@ -827,8 +819,11 @@ main().catch(async (error) => {
     final_total_text: null,
     fee_lines: [],
     line_items: [],
-    status: "blocked",
+    sessionUrl: lastSessionUrl,
+    debugUrl: lastDebugUrl,
+    sessionId: lastSessionId,
+    status: "fatal",
     notes: notes.join(" | "),
   });
-  process.exitCode = 1;
+  process.exit(1);
 });
